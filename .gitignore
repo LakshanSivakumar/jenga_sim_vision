@@ -1,0 +1,21 @@
+# virtualenv
+.venv/
+libpython*.dylib
+
+# generated datasets and renders
+data/
+snapshots/
+*.npz
+
+# the patched PyBullet wheel from before the MuJoCo port: 65 MB, macOS-arm64
+# only, and nothing in the project uses it any more
+wheels/
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# mujoco / os junk
+MUJOCO_LOG.TXT
+.DS_Store
