@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 import random
+from contextlib import contextmanager
 
 import mujoco
 import numpy as np
@@ -41,14 +43,13 @@ def release_renderers() -> None:
 
 
 def default_camera(rng: random.Random | None = None,
-                   randomise: bool | None = None) -> dict:
-    """Camera parameters for one tower.
+                   randomise: bool = False) -> dict:
+    """Camera parameters for one shot.
 
-    Default is a fixed 3/4 view at roughly the height and distance a person
-    sitting at a table would look from. Randomisation is off until we need it
-    for sim-to-real.
+    The default is a fixed 3/4 view at roughly the height and distance a
+    person sitting at a table would look from. With `randomise`, the camera
+    goes anywhere around the tower within the ranges in config.
     """
-    randomise = C.RANDOMISE_CAMERA if randomise is None else randomise
     tower_height = C.NUM_LAYERS * C.BLOCK_HEIGHT
     cam = {
         "azimuth": C.CAMERA_AZIMUTH,
@@ -60,7 +61,81 @@ def default_camera(rng: random.Random | None = None,
         cam["azimuth"] = rng.uniform(*C.CAMERA_AZIMUTH_RANGE)
         cam["elevation"] = rng.uniform(*C.CAMERA_ELEVATION_RANGE)
         cam["distance"] = rng.uniform(*C.CAMERA_DISTANCE_RANGE)
+        cam["target"] = (0.0, 0.0,
+                         tower_height * rng.uniform(*C.CAMERA_TARGET_Z_FRAC_RANGE))
     return cam
+
+
+@contextmanager
+def scene_variation(tw, rng: random.Random | None):
+    """Randomise lighting and colours for one shot, then put them back.
+
+    Only the look of the scene changes -- nothing here touches the physics.
+    Yields a dict describing the variation, for the record, including the
+    background colour to paint behind the tower.
+    """
+    m, d = tw.model, tw.data
+    ground = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "ground")
+    saved = (m.light_dir.copy(), m.light_diffuse.copy(),
+             m.vis.headlight.ambient.copy(), m.vis.headlight.diffuse.copy(),
+             m.geom_rgba[ground].copy())
+    info = {"background": tuple(C.BACKGROUND_COLOUR)}
+    try:
+        if rng is not None and m.nlight:
+            az = math.radians(rng.uniform(0.0, 360.0))
+            el = math.radians(rng.uniform(*C.LIGHT_ELEVATION_RANGE))
+            m.light_dir[0] = (-math.cos(el) * math.cos(az),
+                              -math.cos(el) * math.sin(az),
+                              -math.sin(el))
+            m.light_diffuse[0] = [rng.uniform(*C.LIGHT_DIFFUSE_RANGE)] * 3
+            ambient = rng.uniform(*C.AMBIENT_RANGE)
+            m.vis.headlight.ambient[:] = [ambient] * 3
+            m.vis.headlight.diffuse[:] = [0.9 - ambient] * 3
+
+            shade = rng.uniform(*C.GROUND_BRIGHTNESS_RANGE)
+            tint = [rng.uniform(0.95, 1.05) for _ in range(3)]
+            m.geom_rgba[ground, :3] = [min(1.0, c * shade * t)
+                                       for c, t in zip(C.GROUND_COLOUR, tint)]
+
+            level = rng.uniform(*C.BACKGROUND_BRIGHTNESS_RANGE)
+            info["background"] = tuple(min(1.0, level * rng.uniform(0.96, 1.04))
+                                       for _ in range(3))
+            info.update(light_az=round(math.degrees(az), 1),
+                        light_el=round(math.degrees(el), 1),
+                        ambient=round(ambient, 3), ground_shade=round(shade, 3))
+        mujoco.mj_kinematics(m, d)      # light directions live in data
+        yield info
+    finally:
+        (m.light_dir[:], m.light_diffuse[:], m.vis.headlight.ambient[:],
+         m.vis.headlight.diffuse[:], m.geom_rgba[ground]) = saved
+        mujoco.mj_kinematics(m, d)
+
+
+def render_views(tw, seed: int, n_views: int, size: int | None = None) -> list[dict]:
+    """Render `n_views` shots of the tower as it stands.
+
+    View 0 is the fixed reference shot with the default look. Every other view
+    randomises camera, lighting and colours. Each view has its own random
+    stream, seeded from the tower seed, so changing the number of views never
+    changes what the earlier views look like.
+    """
+    views = []
+    for v in range(n_views):
+        rng = random.Random(seed * 1000 + v) if v > 0 else None
+        cam = default_camera(rng, randomise=v > 0)
+        with scene_variation(tw, rng) as look:
+            rgb, seg = render(tw, cam, size, background=look["background"])
+        views.append({"view": v, "cam": cam, "look": look, "rgb": rgb, "seg": seg})
+    return views
+
+
+def look_params_string(look: dict) -> str:
+    keys = ("light_az", "light_el", "ambient", "ground_shade")
+    parts = [f"{k}={look[k]}" for k in keys if k in look]
+    bg = look.get("background")
+    if bg:
+        parts.append("bg=" + ",".join(f"{c:.3f}" for c in bg))
+    return ";".join(parts) or "default"
 
 
 def camera_params_string(cam: dict) -> str:
@@ -81,10 +156,11 @@ def _mjv_camera(cam: dict) -> mujoco.MjvCamera:
 
 
 def render(tw, cam: dict, size: int | None = None,
-           rng: random.Random | None = None):
+           rng: random.Random | None = None, background=None):
     """Render one view. Returns (rgb uint8 HxWx3, seg int32 HxW of geom ids).
 
-    Background pixels in `seg` are -1.
+    Background pixels in `seg` are -1. `rng` is accepted for backwards
+    compatibility and ignored; use render_views for varied shots.
     """
     size = C.IMAGE_SIZE if size is None else size
     r = _renderer(tw.model, size)
@@ -105,7 +181,8 @@ def render(tw, cam: dict, size: int | None = None,
     seg = np.where(types == mujoco.mjtObj.mjOBJ_GEOM, ids, -1).astype(np.int32)
 
     # Paint a plain background so the dataset is not full of MuJoCo's gradient.
-    bg = np.array([int(255 * v) for v in C.BACKGROUND_COLOUR], dtype=np.uint8)
+    colour = C.BACKGROUND_COLOUR if background is None else background
+    bg = np.array([int(255 * v) for v in colour], dtype=np.uint8)
     rgb[seg < 0] = bg
     return rgb, seg
 
@@ -131,8 +208,13 @@ def save_seg(path, index_map: np.ndarray) -> None:
     Image.fromarray(index_map, mode="L").save(path)
 
 
-def save_binary_mask(path, tw, seg: np.ndarray, index: int) -> int:
-    """Write a 0/255 mask of one block. Returns its pixel count (0 = hidden)."""
-    mask = seg == tw.geom_id[index]
-    Image.fromarray((mask * 255).astype(np.uint8), mode="L").save(path)
-    return int(mask.sum())
+def save_risk_map(path, risk: np.ndarray) -> None:
+    """Pixel value 0 = background or gap, 1 low, 2 medium, 3 high."""
+    Image.fromarray(risk, mode="L").save(path)
+
+
+def block_pixels(tw, seg: np.ndarray) -> dict[int, int]:
+    """How many pixels of each block are visible in this view (0 = hidden)."""
+    ids, counts = np.unique(seg, return_counts=True)
+    by_geom = dict(zip(ids.tolist(), counts.tolist()))
+    return {i: int(by_geom.get(tw.geom_id[i], 0)) for i in range(tw.n_blocks)}

@@ -157,13 +157,24 @@ CAMERA_ELEVATION = -22.0
 CAMERA_TARGET_Z_FRAC = 0.45   # fraction of tower height to look at
 CAMERA_FOV = 50.0
 
-RANDOMISE_CAMERA = False      # turn on later for sim-to-real
+# Several photos of every tower. Physics is the expensive part and rendering
+# is cheap, so each simulated tower yields VIEWS_PER_TOWER images that share
+# one set of labels. View 0 is always the fixed 3/4 view above, so there is a
+# consistent reference shot; every other view randomises the camera, the
+# lighting and the colours, which is what helps a detector trained here cope
+# with real photographs.
+VIEWS_PER_TOWER = 4
 CAMERA_AZIMUTH_RANGE = (0.0, 360.0)
 CAMERA_ELEVATION_RANGE = (-35.0, -10.0)
 CAMERA_DISTANCE_RANGE = (0.38, 0.58)
+CAMERA_TARGET_Z_FRAC_RANGE = (0.35, 0.55)
 
-RANDOMISE_LIGHTING = False
 LIGHT_POS = (0.35, 0.25, 0.75)
+LIGHT_ELEVATION_RANGE = (35.0, 80.0)     # degrees above the horizon
+LIGHT_DIFFUSE_RANGE = (0.30, 0.60)
+AMBIENT_RANGE = (0.40, 0.65)
+BACKGROUND_BRIGHTNESS_RANGE = (0.72, 0.98)
+GROUND_BRIGHTNESS_RANGE = (0.80, 1.10)
 
 BLOCK_COLOUR = (0.78, 0.60, 0.34)   # plain wood
 BLOCK_COLOUR_JITTER = 0.12          # +/- brightness, not hue
@@ -175,8 +186,43 @@ GROUND_SIZE = 1.0
 # Dataset generation
 # ---------------------------------------------------------------------------
 DEFAULT_TOWERS = 20
-CANDIDATES_PER_TOWER = 8      # sample this many blocks per tower; None = all
 DEFAULT_SEED = 0
+# Every block present in a tower is labelled: the model scores a whole tower
+# from one photo, so every visible block needs a label.
+
+# ---------------------------------------------------------------------------
+# Risk levels
+# ---------------------------------------------------------------------------
+# Removing a block either collapses the tower or it does not -- measured, the
+# outcome is completely deterministic: 480 removals under +/-20% friction and
+# a random nudge, and not one flipped. So "medium" cannot mean "might
+# collapse". It means the tower SURVIVED but was left more fragile.
+#
+# Fragility is measured by tilting the table: the table is tilted slowly in
+# each of the tower's four face directions and we record the angle at which
+# the tower gives way; the weakest direction is its tilt margin. We measure
+# it twice -- for the tower as it stands (`base_tilt_deg`, per tower) and
+# again after each removal (`tilt_margin_deg`, per block; 0 if the removal
+# collapsed it). The difference is `margin_drop_deg`: how much fragility THIS
+# block's removal added.
+#
+# The drop, not the absolute margin, decides medium vs low. An absolute
+# threshold was tried first and measured to describe the tower, not the
+# block: surviving removals leave the margin within 0.3 deg of the tower's own
+# for 85% of blocks, so a fragile tower made every one of its blocks "medium".
+#
+#   high    collapsed, or the margin left is under RISK_HIGH_BELOW_DEG
+#   medium  survived, but the removal cut the margin by RISK_MEDIUM_DROP_DEG+
+#   low     survived, and the tower is about as robust as before
+#
+# Train on the continuous numbers and bin at the end; the thresholds can then
+# move without regenerating anything.
+TILT_MAX_DEG = 15.0           # an intact tower tips over as a whole near here
+TILT_RAMP_SECONDS = 2.0       # 0 -> TILT_MAX_DEG: slow enough to be quasi-static
+TILT_CHECK_EVERY = 10         # steps between failure checks (~0.15 deg)
+TILT_DIRECTIONS = ((1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0))
+RISK_HIGH_BELOW_DEG = 1.0
+RISK_MEDIUM_DROP_DEG = 0.3    # 2x the tilt test's resolution; see README
 
 # ---------------------------------------------------------------------------
 # Push mode -- the way people actually take a middle block out

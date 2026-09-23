@@ -73,12 +73,20 @@ Expect `3.13.0` or newer.
 
     .venv/bin/python -m pytest -q
 
-Takes about 2.5 minutes -- most of it is simulating towers for real. The
+Takes about 3 minutes -- most of it is simulating towers for real. The
 headline test is `test_untouched_tower_stands_for_ten_seconds`.
 
 Run one test, with print output visible:
 
     .venv/bin/python -m pytest tests/test_stability.py -k untouched -s
+
+Just the risk labelling (grid, tilt test, risk levels), about 40 seconds:
+
+    .venv/bin/python -m pytest tests/test_risk.py -q
+
+Two tests in `tests/test_pull_directions.py` currently fail. They assert that
+side-pulling blocks 48 and 50 leaves the tower standing, which the physics
+does not do; pull mode is not used for the dataset.
 
 ---
 
@@ -120,72 +128,111 @@ Options:
 
 ## 3. Generate a dataset
 
-The normal run. Delete mode is the default and the only mode whose labels are
-trustworthy -- see "Why the dataset uses delete mode" in the README.
-
     .venv/bin/python generate.py --towers 20 --out data/my_run
 
-All options:
+For every tower: build it, knock random gaps in it, photograph it from several
+angles, then remove **every** block in turn and measure its risk. Budget about
+a minute of wall time per tower with the default workers.
 
 | flag | default | meaning |
 |---|---|---|
 | `--towers N` | 20 | how many towers to build |
-| `--mode` | `delete` | `delete` or `pull` |
-| `--candidates N` | 8 | blocks tried per tower; `all` for every legal block |
+| `--views N` | 4 | photos per tower; view 0 is the fixed reference shot, the rest randomise camera, lighting and colours |
 | `--workers N` | half your cores | parallel processes; `1` = serial |
 | `--seed N` | 0 | changes every tower in the run |
 | `--out DIR` | `data/` | where to write |
-| `--pull-direction` | `end` | `end`, `side` or `all`; only with `--mode pull` |
 
-A bigger run, every block, all cores:
+A big overnight run:
 
-    .venv/bin/python generate.py --towers 100 --candidates all --workers 8 --out data/big_run
+    .venv/bin/python generate.py --towers 300 --views 6 --out data/big_run
 
 Reproducibility: a tower is fully determined by its seed, so `--workers` only
-changes speed. The CSVs come out byte-identical whether you use 1 worker or 8.
-Different `--seed` gives different towers.
+changes speed; the CSVs come out identical whatever it is set to. Changing
+`--views` adds or removes photos but never changes the labels or the earlier
+views.
 
-Debugging a crash -- run serially so the traceback is readable:
+Debugging a crash -- one tower, serial, so the traceback is readable:
 
-    .venv/bin/python generate.py --towers 2 --candidates 2 --workers 1 --out /tmp/scratch_run
+    .venv/bin/python generate.py --towers 1 --views 1 --workers 1 --out /tmp/scratch_run
+
+The summary at the end prints the low / medium / high split, how much margin
+surviving removals cost, and how often the structural rule agrees with the
+physics. That
+last number should sit around 98%; if it drops sharply, something in the
+physics has changed.
 
 ---
 
 ## 4. Look at the labels
 
-    .venv/bin/python inspect_data.py data/my_run --balanced
+Whole towers, every block coloured green / amber / red by risk:
 
-Writes `data/my_run/sample_grid.png`: sample towers with the candidate block
-tinted and outlined, green `stable`, red `collapse`, yellow `stuck`. Prints
-per-outcome statistics to the terminal too.
+    .venv/bin/python inspect_data.py data/my_run
+
+One highlighted block per panel, evenly across the three levels:
+
+    .venv/bin/python inspect_data.py data/my_run --blocks --balanced --n 30 --cols 6
+
+Writes `data/my_run/sample_grid.png` and prints the label statistics.
 
 | flag | meaning |
 |---|---|
-| `--balanced` | sample evenly across outcomes, so rare labels still appear |
-| `--n N` | how many samples in the grid (default 12) |
-| `--cols N` | grid width (default 4) |
+| `--blocks` | one block per panel instead of whole towers |
+| `--balanced` | blocks mode: sample evenly across low / medium / high |
+| `--legal-only` | blocks mode: skip top-layer blocks, which are not legal moves |
+| `--view N` | which photo of each tower to show (default: a random one) |
+| `--n N`, `--cols N` | panels, and how many per row |
+| `--medium-drop X` | preview a different medium/low threshold: degrees of margin a removal must cost |
+| `--high-below X` | preview a different high/medium threshold |
 | `--out FILE` | write the PNG somewhere else |
+
+The two threshold flags re-bin from the stored margins on the fly, so you can
+try a split before committing to it -- nothing is regenerated.
 
 ---
 
 ## 5. Read the data yourself
 
-    .venv/bin/python -c "import pandas as pd; d=pd.read_csv('data/my_run/labels.csv'); print(d['outcome'].value_counts()); print(d.head())"
-
 What a run produces:
 
     data/my_run/
-      images/tower_0003.png             RGB before the removal, 512x512
-      masks/tower_0003_seg.png          segmentation, pixel value = block index
-      masks/tower_0003_block_17.png     binary mask of the candidate block
-      states/tower_0003.npz             qpos + qvel, the full sim state
-      labels.csv                        one row per trial
-      towers.csv                        one row per tower
-      sample_grid.png                   written by inspect_data.py
+      images/tower_0003_v0.png        photo, view 0
+      masks/tower_0003_v0_seg.png     pixel -> block index 1-54, 0 = none
+      risk/tower_0003_v0_risk.png     pixel -> 0 none, 1 low, 2 medium, 3 high
+      states/tower_0003.npz           physics state
+      towers.csv                      one row per tower, incl. presence grid
+      labels.csv                      one row per block
+      views.csv                       one row per image
+      visibility.csv                  pixels of each block in each image
 
-When training, drop rows where `mask_pixels == 0` -- the candidate block is
-completely hidden from the camera in those, so they cannot be learned from the
-image.
+The risk level split:
+
+    .venv/bin/python -c "import pandas as pd; d=pd.read_csv('data/my_run/labels.csv'); print(d.risk_level.value_counts())"
+
+In Python -- everything the two model stages need:
+
+```python
+import pandas as pd
+from jenga_sim.dataset import load_block_mask
+
+towers = pd.read_csv("data/my_run/towers.csv", dtype={"grid": str})
+labels = pd.read_csv("data/my_run/labels.csv")
+
+# Stage 2 (grid -> risk): a tower's grid, plus every block's label
+grid = towers.set_index("tower_id").grid[3]      # '1' present / '0' gap, 54 chars
+blocks = labels[labels.tower_id == 3]             # block_id is 1-based: grid[block_id - 1]
+
+# Stage 1 (photo -> blocks): one block's pixels in one photo
+mask = load_block_mask("data/my_run", tower_id=3, view=0, block_id=17)
+```
+
+Two things to remember when training:
+
+- **Drop hidden block/view pairs** -- `visibility.csv` rows with `pixels == 0`.
+  The block is invisible in that photo, so nothing can be learned from it.
+- **Train on the continuous columns, bin at the end.** `tilt_margin_deg` and
+  `margin_drop_deg` carry more information than the three levels, and let you
+  move the thresholds without retraining.
 
 ---
 
@@ -197,14 +244,17 @@ Everything tunable is in `jenga_sim/config.py`, in real SI units. A block is
     open jenga_sim/config.py          # macOS
     notepad jenga_sim\config.py       # Windows
 
-The three worth touching, with their measured trade-offs written next to them:
+The ones worth touching, with their measured trade-offs written next to them:
 
+- `RISK_MEDIUM_DROP_DEG` / `RISK_HIGH_BELOW_DEG` -- how much margin a removal
+  must cost to be medium, and how little margin left is high. Preview first
+  with `inspect_data.py --medium-drop`.
 - `JITTER_SIZE_FRAC` -- how much blocks vary in size. Controls how many blocks
   are load-free, and how many towers stay standing. Read the table first.
 - `GAPS_MIN` / `GAPS_MAX` -- blocks pre-removed before trials. This is what
-  produces collapse labels at all; pristine towers almost never fall.
-- `OBSERVE_SECONDS` -- how long the tower is watched after a removal.
-  Directly sets how long generation takes.
+  produces high-risk labels at all; pristine towers almost never fall.
+- `VIEWS_PER_TOWER` -- photos per tower. Cheap: only rendering.
+- `TILT_RAMP_SECONDS` -- slower is more accurate and slower to generate.
 
 After changing anything physical, re-run the tests before generating data:
 
@@ -227,6 +277,12 @@ out = R.delete_block(tw, tw.find(level=8, slot=1))
 print(out.outcome, out.max_displacement)
 
 T.restore_state(tw, state)          # put it back, exactly
+
+from jenga_sim import risk
+base = risk.tilt_margin(tw, state)                # the tower's own margin
+r = risk.assess_block(tw, tw.find(level=8, slot=1), state, base)
+print(r.risk_level, r.tilt_margin_deg, r.margin_drop_deg)
+print(risk.grid_string(tw))                       # the presence grid
 ```
 
 `R.push_block` exists and works mechanically but is not exposed on the
@@ -258,6 +314,13 @@ core can beat using more of them.
 Normal. Towers that drift on their own are thrown away rather than used. If
 almost every tower is rejected, `JITTER_SIZE_FRAC` is too high.
 
-**A label class is missing**
-The summary at the end of a run tells you which knob to turn. `stuck` can only
-ever appear in pull mode.
+**A risk level is missing, or the split looks lopsided**
+The summary at the end of a run tells you which knob to turn. For medium vs
+low, set `RISK_MEDIUM_DROP_DEG` to a percentile of the margin drop printed in
+the summary -- and preview it with `inspect_data.py --medium-drop` before
+regenerating anything.
+
+**`inspect_data.py` says there is no labels.csv, or complains about columns**
+It reads the current output format only. Folders written before the risk
+levels were added (per-block `mask` files, a `mode` column) will not load --
+regenerate them.

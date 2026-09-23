@@ -1,11 +1,16 @@
-# Jenga Risk Vision — Physics Simulator (v0.1)
+# Jenga Risk Vision — Physics Simulator (v0.2)
 
-Generates training data for a computer-vision model that predicts, per Jenga
-block, how risky it is to remove. There is no real dataset with per-block
-removal outcomes, so we make one: build a tower in MuJoCo, photograph it, then
-try removing each block and record what happened.
+Generates training data for a computer-vision system that looks at a photo of
+a Jenga tower, finds every block, and gives each one a risk level for removal:
+**low**, **medium** or **high**.
 
-This is v0.1 — the simulator and data generator only. No models yet.
+There is no real dataset of per-block removal outcomes, so we make one: build
+a tower in MuJoCo, photograph it from several angles, then remove every block
+in turn and measure what happens to the tower.
+
+This is the simulator and data generator only. No models yet — but see
+[the recommended pipeline](#recommended-model-pipeline), because the data is
+shaped around it.
 
 ---
 
@@ -95,23 +100,27 @@ of watchable speed).
 ### `generate.py` — headless dataset
 
 ```bash
-python generate.py --towers 20 --mode delete --candidates 8 --out data/
-python generate.py --towers 20 --mode pull   --candidates 8 --out data/
+python generate.py --towers 20 --out data/my_run
 ```
 
-`--candidates all` tries every legal block instead of a sample. Prints a label
-breakdown and average time per trial at the end, and names the config knob to
-turn if a label is missing.
+Every tower is photographed `--views` times (default 4) and **every block in
+it** gets a risk label. Prints the risk-level breakdown, the survivors' tilt
+margins, and how often the structural rule agrees with the physics. See
+[USAGE.md](USAGE.md) for every flag.
+
+Budget roughly a minute of wall time per tower with the default 5 workers:
+each surviving block gets a tilt test, and that is where the time goes.
 
 ### `inspect_data.py` — sanity-check by eye
 
 ```bash
-python inspect_data.py data/ --balanced --n 12
+python inspect_data.py data/my_run                         # whole towers
+python inspect_data.py data/my_run --blocks --balanced     # single blocks
 ```
 
-Writes `data/sample_grid.png`: sample towers with the candidate block tinted
-and outlined — green `stable`, red `collapse`, yellow `stuck` — plus
-per-outcome statistics in the terminal.
+Towers mode colours every block green / amber / red by risk — what the
+finished model should produce from a photo. Blocks mode highlights one block
+per panel, which is better for checking individual labels.
 
 ---
 
@@ -147,27 +156,126 @@ magically faster; it just let us stop lying about scale.
 
 ---
 
-## Label definitions
+## Risk levels
 
-| Label | Means |
+| Level | Means |
 |---|---|
-| `collapse` | any **other** block moved more than `COLLAPSE_DISPLACEMENT` (default 1 cm) **or** tilted more than `COLLAPSE_TILT_DEG` (default 10°), measured against its pose immediately before the removal |
-| `stuck` | pull mode only: the block did not reach the extraction distance within the time budget while respecting `PULL_MAX_FORCE` |
-| `stable` | the block came out and nothing else moved past those thresholds |
+| **high** | removing the block collapses the tower, or leaves it falling at the slightest touch (`tilt_margin_deg < RISK_HIGH_BELOW_DEG`, default 1°) |
+| **medium** | the tower survives, but is measurably more fragile than before (`margin_drop_deg ≥ RISK_MEDIUM_DROP_DEG`, default 0.3°) |
+| **low** | the tower survives, about as robust as it was |
 
-Continuous values recorded alongside the label:
+Fragility is measured with a **tilt test**: the table is tilted slowly towards
+each of the tower's four faces until the tower gives way, and the weakest
+direction is its tilt margin. It is measured twice:
 
-- `max_displacement` — furthest any other block moved, in metres
-- `max_tilt_deg` — largest orientation change of any other block
-- `peak_force` — highest applied axial pulling force, in newtons (excluding
-  weight support and grip torque). **This is the
-  "ease of pulling" measure**, and the basis for "tempting" later: a block
-  with low `peak_force` but high collapse risk is a trap.
-- `extract_time` — seconds to pull the block clear
+- `base_tilt_deg` (in `towers.csv`) — the tower as it stands, before anything
+  is removed.
+- `tilt_margin_deg` (in `labels.csv`) — what is left after removing this
+  block. **0 means the removal collapsed the tower.**
+
+Their difference is `margin_drop_deg`: how much fragility **this block's**
+removal added. That drop is what separates medium from low.
+
+Train on the continuous columns and bin at the end — the thresholds can then
+move without regenerating anything, and `inspect_data.py --medium-drop X`
+previews a different split.
+
+"Collapse" itself means any other block moved more than
+`COLLAPSE_DISPLACEMENT` (1 cm) or tilted more than `COLLAPSE_TILT_DEG` (10°).
+
+### Why "medium" is defined like this
+
+Three definitions were tried, and measured, before this one.
+
+**Probability of collapse — does not work.** Each block was removed 8 times
+under invisible perturbations (±20% friction on every block, a small random
+nudge): across 60 blocks, **every one came out at exactly 0% or 100%**.
+Removing a block either collapses the tower or it does not, and small
+uncertainties never change which. That leaves two classes, not three.
+
+**Displacement bands — too thin.** Displacement is sharply bimodal (median
+1.5 mm, then straight to 250 mm+), with only 9% of removals in between, and
+"shifted a bit" is not really "risky".
+
+**Absolute tilt margin — describes the tower, not the block.** An early probe
+showed survivors' margins spread over 4–8°, which looked like a good third
+class. But that spread was *between towers*: different towers start with
+different margins. Within a tower, **85% of surviving removals change the
+margin by less than 0.3°**. An absolute threshold therefore labelled every
+block in an already-wobbly tower "medium" — on the first two towers generated,
+77% medium and 1% low — which says nothing about which block to take.
+
+**Margin drop — what is used.** Measuring the change a removal causes, relative
+to the tower's own starting margin, is a property of the block. It is a subtle
+signal — most removals cost nothing, a tail costs up to a degree — and the
+0.3° threshold is twice the tilt test's resolution (~0.15°), so it sits above
+measurement noise.
+
+Validated on 20 towers, 897 blocks:
+
+| | |
+|---|---|
+| split | **low 59.8% · medium 15.4% · high 24.9%** |
+| towers containing all three levels | 18 of 20 |
+| survivors' margin drop | median 0.00°, p75 0.30°, p90 0.60°, p95 0.75° |
+| structural rule agrees with collapse | 99.1% |
+
+Medium has a clear physical meaning. **Edge blocks are medium 27% of the time,
+middle blocks 3%.** Taking an edge from a full layer leaves two blocks offset to
+one side, so that layer's support shifts off-centre and the tower tips more
+easily that way; taking the middle leaves the layer symmetric. That is the
+real-Jenga instinct "take the middle ones first", recovered from physics.
+
+### The structural rule
+
+One line predicts collapse-on-removal with **98.0% accuracy** on 4,155
+simulated removals, using nothing but which blocks are present:
+
+> A removal collapses the tower if it leaves its layer **empty, or standing on
+> a single edge block**.
+
+| left in the layer after removal | collapse |
+|---|---|
+| nothing, or one edge block | 100% |
+| middle only, two blocks, or both edges | 2–5% |
+
+This is the real-Jenga rule, and it is why the data is shaped the way it is:
+**high risk is mostly a structural fact about the tower**, visible in which
+slots are filled. `jenga_sim.risk.structural_rule` implements it, and both
+`generate.py` and `inspect_data.py` report how often the physics agrees with
+it — a free check that nothing has broken.
+
+The physics earns its keep on the medium/low boundary, which depends on gaps
+across several layers, and on the ~2% of collapses the rule misses.
+
+### Recommended model pipeline
+
+```
+photo ──► CNN finds the blocks ──► presence grid (18 × 3) ──► risk model ──► low / medium / high per block
+```
+
+- **Stage 1 is the computer vision**: detect and segment the blocks, and work
+  out which slots are filled. The simulator provides unlimited labelled images
+  and masks (`images/`, `masks/`), from several randomised angles per tower.
+  Pretrained detectors (e.g. YOLO-seg) are strong here.
+- **Stage 2 reads the grid** (`towers.csv` → `grid`) and predicts each block's
+  risk or tilt margin. Because a grid from a real photo is exactly the same
+  kind of object as one from the simulator, this stage has **no sim-to-real
+  gap at all**.
+- **Train an end-to-end CNN (photo → risk) as the comparison.** If it gets
+  close to the structural rule on high risk, it has learned the grid; if not,
+  that is the argument for splitting.
+- **Photograph a real tower** 30–50 times and hand-label the filled slots.
+  Detectors trained only on simulated images rarely transfer perfectly, and
+  that small real set is how you will know.
 
 ---
 
 ## Removal modes
+
+The dataset uses **`delete` followed by the tilt test** for every block.
+`pull` and `push` remain in the code and in `play.py`, but no longer feed the
+dataset — see [below](#why-the-dataset-uses-delete-mode).
 
 **`delete`** — the block is teleported away instantly, then the tower is
 watched for `OBSERVE_SECONDS`. Cheap, and the cleanest measure of "was this
@@ -201,32 +309,46 @@ state puts candidate blocks back while keeping pre-existing gaps parked.
 ## Output format
 
 ```
-data/
-  images/tower_0003.png                RGB before the removal, 512x512
-  masks/tower_0003_seg.png             segmentation, pixel value = block index
-  masks/tower_0003_block_17.png        binary mask of the candidate block
-  states/tower_0003.npz                saved sim state (qpos + qvel)
-  labels.csv                           one row per (tower, block) trial
-  towers.csv                           one row per tower
+data/my_run/
+  images/tower_0003_v0.png          photo, view 0 (the fixed 3/4 reference shot)
+  images/tower_0003_v1.png          ...more views: randomised camera, light, colours
+  masks/tower_0003_v0_seg.png       pixel -> block index 1-54, 0 = none
+  risk/tower_0003_v0_risk.png       pixel -> 0 none, 1 low, 2 medium, 3 high
+  states/tower_0003.npz             physics state (qpos, qvel, seed, gaps)
+  towers.csv                        one row per tower, including the grid
+  labels.csv                        one row per block, every block in every tower
+  views.csv                         one row per image
+  visibility.csv                    pixels of each block in each image
 ```
 
-`labels.csv`: `tower_id, block_id, level, position_in_level, mode, outcome,
-max_displacement, max_tilt_deg, peak_force, extract_time, mask_pixels, seed,
-camera_params`
+**`towers.csv`** — `tower_id, seed, num_blocks, num_gaps, grid,
+base_tilt_deg, settle_seconds`. `grid` is 54 characters, `1` = block present,
+`0` = gap; character *i* is block index *i* = `level * 3 + slot`, bottom layer
+first. `base_tilt_deg` is the tower's own tilt margin before anything is
+removed.
 
-`towers.csv`: `tower_id, seed, num_blocks, num_gaps, settled, settle_seconds,
-camera_params`
+**`labels.csv`** — `tower_id, block_id, level, position_in_level, legal,
+outcome, max_displacement, max_tilt_deg, tilt_margin_deg, risk_level, seed`.
+`block_id` is 1-based (it matches the seg maps); the grid is 0-based, so
+`grid[block_id - 1]`. `legal` is false for the top layer, which real Jenga
+does not allow taking from — those blocks are still labelled, because they
+still appear in the photo.
 
-In `*_seg.png` the pixel value is the **block index** (1–54, 0 = background),
-not the raw MuJoCo geom id — geom ids are an implementation detail, block
-indices are stable. `mask_pixels` is 0 when the candidate block is completely
-hidden from the camera; those rows are unlearnable from the image alone, so
-filter them out when training.
+**`views.csv`** — `tower_id, view, camera_params, look_params`: enough to
+reproduce each shot.
 
-Saved files contain block poses, velocities, the seed and gap indices.
-Restoration resets solver warm-start data and reapplies the saved gaps'
-collision and gravity flags so one removal trial cannot contaminate the next.
-Reproduction requires the same simulator version and configuration.
+**`visibility.csv`** — `tower_id, view, block_id, pixels`. A block with 0
+pixels in a view is completely hidden there; drop those block/view pairs when
+training anything that looks at pixels.
+
+A single block's mask is simply `seg == block_id`
+(`jenga_sim.dataset.load_block_mask` does it), so per-block mask files are not
+written — at 54 blocks and several views that would be hundreds of files per
+tower carrying nothing the seg map does not.
+
+Every image of a tower shares the same labels: the risk of a block does not
+depend on where the camera is. That is what makes extra views nearly free
+training data — physics is the expensive part, rendering is cheap.
 
 ---
 
@@ -255,15 +377,17 @@ Everything lives in `jenga_sim/config.py`. The three that matter most:
    because taking one block from a full 3-block layer still leaves two to
    carry the load. Raise the range for more collapses.
 
-3. **`PULL_MAX_FORCE`** (default 25x block weight ≈ 4.14 N) — the actual
-   axial force cap. Lower it for gentler attempts and potentially more `stuck`
-   outcomes. `PULL_MAX_TORQUE` separately caps the attitude-control torque.
+3. **`RISK_MEDIUM_DROP_DEG` / `RISK_HIGH_BELOW_DEG`** (default 0.3° / 1°) —
+   how much margin a removal must cost to count as medium, and how little
+   margin left counts as high. These only affect the `risk_level` column; the
+   margins are always stored, so you can re-bin later without regenerating.
+   Preview a split with `inspect_data.py --medium-drop 0.5`.
 
-Also worth knowing: `COLLAPSE_DISPLACEMENT` / `COLLAPSE_TILT_DEG` define the
-labels themselves; `TIME_STEP` trades speed against stability;
-`OBSERVE_SECONDS` directly controls how long generation takes;
-`RANDOMISE_CAMERA` and `RANDOMISE_LIGHTING` are off by default and exist for
-sim-to-real later.
+Also worth knowing: `VIEWS_PER_TOWER` sets how many photos each tower gets
+(cheap — only rendering); `TILT_RAMP_SECONDS` trades tilt-test accuracy
+against generation time; `COLLAPSE_DISPLACEMENT` / `COLLAPSE_TILT_DEG` define
+what counts as a collapse; `OBSERVE_SECONDS` is how long the tower is watched
+after a removal.
 
 ---
 
@@ -358,47 +482,62 @@ instantaneous removal does not, and that remains unexplained.
 
 ## Known limitations
 
-- **`extract_time` remains close to distance ÷ speed** for loose blocks, but
-  increases when friction causes the compliant grip to lag. A `stuck` row
-  records the time budget. Use force and outcome together when assessing risk.
-- **`stuck` cannot occur in delete mode** — it is a pull-only label.
-- **The label mix depends heavily on `GAPS_MAX` and `JITTER_SIZE_FRAC`**, not
-  on anything intrinsic to Jenga. Do not read the base rates as physical fact.
+- **Medium vs low is the soft boundary.** High is clean — a structural rule
+  gets 98% of it. Medium rests on a margin drop of a fraction of a degree,
+  measured with ~0.15° resolution. It is real, but it is small. Expect any
+  model to separate high from the rest much more easily than medium from low,
+  and treat medium as the class to scrutinise first if the labels look wrong.
+- **The tower still colours the medium label a little.** Sturdier towers have
+  more medium blocks (r = +0.62 between `base_tilt_deg` and a tower's medium
+  share), because a tower with more margin has more to lose. That is far
+  better than the absolute threshold, which made every block in a fragile
+  tower medium, but it is not zero. `base_tilt_deg` itself is a useful
+  tower-level risk a finished system could report alongside the blocks.
+- **Slow creep, not collapse, after about 2 seconds.** Every real collapse
+  happens within 0.25 s of a removal (the collapse rate is flat from 0.25 s to
+  2 s). Past that, towers creep steadily at 0.1–0.17 cm/s without
+  accelerating, and a long enough watch mislabels that as collapse — at 8 s,
+  52% of removals would read "collapse". That is why `OBSERVE_SECONDS` is 0.5.
+  The creep itself is unexplained.
+- **The tilt test measures tipping, not every way to fail.** It tilts gravity,
+  which is equivalent to tilting the table. A careless hand, a knock on one
+  block, or the next player's move are not modelled directly — tilt is a
+  standard stand-in for "how much disturbance can this take".
+- **The tilt ramp reads slightly high.** The tower is already moving before it
+  has travelled the 1 cm that counts as failure, and the table keeps tilting
+  meanwhile. The bias is the same for every block, so rankings are fine;
+  absolute angles are a little generous. A slower `TILT_RAMP_SECONDS` reduces
+  it at the cost of generation time.
+- **The label mix depends heavily on `GAPS_MAX`, `JITTER_SIZE_FRAC` and the risk
+  thresholds**, not on anything intrinsic to Jenga. Do not read the base rates
+  as physical fact.
+- **Blocks are identical apart from a 0.2% size jitter.** Real blocks are
+  warped, chipped and vary in friction. That realism would change which blocks
+  are loose.
 - **A fraction of towers will not stand** at the default size jitter and get
   rejected during generation. That costs throughput, not correctness.
-- **Pull mode is slower than delete mode**, because several seconds of
-  physical motion are integrated with finer contact substeps.
-- **The grip is an idealised hand**, not a simulated pair of fingers. It
-  supports the block's own weight at its centre and applies bounded torque;
-  finger contact geometry and tactile probing are not modelled.
-- **Pull and delete labels can differ.** Pulling transmits friction and can
-  move neighbouring blocks; deletion cannot. `collapse` includes sliding past
-  the displacement threshold, even when the tower remains upright.
-- **No on-screen control overlay in `play.py`.** MuJoCo's passive viewer has no
-  simple custom-text API, so the controls print to the terminal and live status
-  goes there too. MuJoCo's own overlay is on `F1`.
+- **Simulated images are not photographs.** Randomised views help, but plain
+  colours and perfect edges are still a gap. See the pipeline section for why
+  stage 2 does not care, and why stage 1 needs some real photos.
 - **`play.py` cannot swap the model live**, so pressing `N` closes the viewer
-  and reopens it with a new tower.
-- **No sim-to-real work yet.** Camera and lighting randomisation are
-  implemented but off.
+  and reopens it with a new tower. Its controls print to the terminal because
+  MuJoCo's passive viewer has no simple custom-text API.
 
 ---
 
-## Ideas for v0.2
+## Ideas for next
 
-- Turn on `RANDOMISE_CAMERA` / `RANDOMISE_LIGHTING`, add wood textures, then
-  test on real photographs.
+- **Train the stage-2 baseline now** — grid → risk, on `towers.csv` and
+  `labels.csv` alone. The structural rule is the bar to beat on high risk; the
+  interesting question is how well anything predicts medium vs low.
+- **Photograph a real tower** and hand-label filled slots, to measure how well
+  a sim-trained detector transfers.
+- Wood-grain textures and chipped edges on the blocks, to narrow the look gap.
 - Per-block friction variation, and warping rather than uniform scaling — the
-  size-jitter result suggests block imperfection drives most of the
-  interesting behaviour.
-- Implement `STACK_REMOVED_ON_TOP` so towers evolve like real games.
-- Record the full force–time curve per pull, not just the peak. The shape
-  (static-friction spike vs sustained drag) should separate "wedged" from
-  "heavy" blocks.
-- Define "tempting" concretely: low `peak_force` percentile AND `collapse`
-  outcome, then measure how common such blocks actually are.
-- Hand-crafted features (blocks above, gaps in the layer, load carried,
-  centre-of-mass offset) for a Random Forest baseline before going to a CNN.
-  Note that `load carried` is directly measurable in sim but not from a photo —
-  which is exactly the thing the vision model has to infer.
-- Parallelise generation across processes; each tower is independent.
+  size-jitter result suggests block imperfection drives much of the loose-block
+  behaviour.
+- Implement `STACK_REMOVED_ON_TOP` so towers evolve like real games, rather
+  than only losing blocks.
+- Show the selected block's risk live in `play.py`.
+- Record the tilt margin in each of the four directions, not only the weakest:
+  "risky if you knock it left" is more useful than a single number.

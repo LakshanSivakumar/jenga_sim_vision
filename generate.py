@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Headless dataset generator.
 
-    python generate.py --towers 20 --mode pull --out data/
+    python generate.py --towers 20 --out data/my_run
 
-Builds towers, saves an image + masks + sim state for each, then for every
-candidate block restores the state, removes the block, and records what
-happened.
+For each tower: build it, let it settle, knock some random gaps in it, then
+photograph it from several angles. Then, for EVERY block still standing,
+remove it and measure the risk -- whether the tower collapses, and if not,
+how far the table can be tilted before it does. See jenga_sim/risk.py.
 
 Towers are independent, so they are generated in parallel across processes.
 Physics here is single-threaded CPU work -- the GPU is only used to draw the
-one image per tower -- so worker count is the main throughput lever.
+images -- so worker count is the main throughput lever.
 """
 
 from __future__ import annotations
@@ -21,9 +22,10 @@ import random
 import time
 from collections import Counter
 
+import numpy as np
 from tqdm import tqdm
 
-from jenga_sim import camera, config as C, removal, tower as T
+from jenga_sim import camera, config as C, risk, tower as T
 from jenga_sim.dataset import DatasetWriter
 from jenga_sim.labeling import max_displacement
 
@@ -34,7 +36,7 @@ def default_workers() -> int:
     On a 4+6 machine like an M4 this picks 5: the four performance cores plus
     one, which is about where the returns flatten off.
     """
-    return 4
+    return max(1, (os.cpu_count() or 2) // 2)
 
 
 def build_one(seed: int, rng: random.Random):
@@ -59,118 +61,107 @@ def build_one(seed: int, rng: random.Random):
     return tw, True, secs
 
 
+def is_legal(level: int) -> bool:
+    """Real-Jenga rule: the top layer(s) cannot be taken from."""
+    return level <= C.NUM_LAYERS - 1 - C.EXCLUDE_TOP_LAYERS
+
+
 # ---------------------------------------------------------------------------
 # One tower's worth of work
 # ---------------------------------------------------------------------------
-# This runs in a worker process, so everything it touches must be picklable:
-# it takes plain values in and returns plain dicts out. It writes its own
-# images, masks and states (those are per-tower files, no contention) but
-# never the CSVs -- the parent writes those so the rows stay ordered.
+# Runs in a worker process, so everything it touches must be picklable: plain
+# values in, plain dicts out. It writes its own image files (per-tower files,
+# no contention) but never the CSVs -- the parent writes those so rows stay
+# in a fixed order.
 
 def run_tower(job: dict) -> dict:
-    i = job["tower_id"]
-    seed = job["seed"]
-    mode = job["mode"]
-    pull_direction = job["pull_direction"]
-    per_tower = job["per_tower"]
-
+    i, seed, n_views = job["tower_id"], job["seed"], job["views"]
     rng = random.Random(seed)
-    result = {"tower_id": i, "seed": seed, "ok": False,
-              "tower_row": None, "trials": [], "times": []}
+    result = {"tower_id": i, "seed": seed, "ok": False, "tower": None,
+              "labels": [], "views": [], "visibility": [], "seconds": 0.0}
+    t0 = time.time()
 
     tw, ok, settle_secs = build_one(seed, rng)
     if not ok:
         return result
 
     paths = DatasetWriter(job["out"], write_csv=False)
-    cam = camera.default_camera(rng)
-    cam_str = camera.camera_params_string(cam)
-
-    # Everything below is measured from THIS state.
     T.save_state_npz(tw, paths.state_path(i))
-    mem_state = T.save_state(tw)
+    state = T.save_state(tw)
+    grid = risk.grid_string(tw)
+    present = tw.present_ids()
 
-    rgb, seg = camera.render(tw, cam, rng=rng)
-    camera.save_rgb(paths.image_path(i), rgb)
-    camera.save_seg(paths.seg_path(i), camera.block_index_map(tw, seg))
+    # Photos of the tower as it stands, before anything is taken out.
+    shots = camera.render_views(tw, seed, n_views)
+    index_maps = {}
+    for shot in shots:
+        v = shot["view"]
+        index_maps[v] = camera.block_index_map(tw, shot["seg"])
+        camera.save_rgb(paths.image_path(i, v), shot["rgb"])
+        camera.save_seg(paths.seg_path(i, v), index_maps[v])
+        result["views"].append(dict(
+            tower_id=i, view=v,
+            camera_params=camera.camera_params_string(shot["cam"]),
+            look_params=camera.look_params_string(shot["look"])))
+        pixels = camera.block_pixels(tw, shot["seg"])
+        for b in present:
+            result["visibility"].append(dict(tower_id=i, view=v,
+                                             block_id=b + 1, pixels=pixels[b]))
+
+    base_tilt = risk.tilt_margin(tw, state)
+
+    # Every block still standing gets a risk label.
+    levels = {}
+    for b in present:
+        r = risk.assess_block(tw, b, state, base_tilt)
+        levels[b] = r.risk_level
+        result["labels"].append(dict(
+            tower_id=i, block_id=b + 1,
+            level=tw.level_of[b], position_in_level=tw.slot_of[b],
+            legal=is_legal(tw.level_of[b]),
+            outcome=r.outcome,
+            max_displacement=round(r.max_displacement, 5),
+            max_tilt_deg=round(r.max_tilt_deg, 3),
+            tilt_margin_deg=round(r.tilt_margin_deg, 3),
+            margin_drop_deg=round(r.margin_drop_deg, 3),
+            risk_level=r.risk_level, seed=seed))
+
+    for v, index_map in index_maps.items():
+        camera.save_risk_map(paths.risk_path(i, v), risk.risk_map(index_map, levels))
 
     result["ok"] = True
-    result["tower_row"] = dict(
+    result["tower"] = dict(
         tower_id=i, seed=seed, num_blocks=len(tw.present_ids()),
-        num_gaps=tw.n_gaps, settled=True,
-        settle_seconds=round(settle_secs, 3), camera_params=cam_str,
-    )
-
-    candidates = tw.candidate_ids()
-    if mode == "pull" and pull_direction == "side":
-        candidates = [b for b in candidates if "side" in removal.pull_directions(tw, b)]
-    rng.shuffle(candidates)
-    if per_tower is not None:
-        candidates = candidates[:per_tower]
-
-    for block in candidates:
-        block_index = block + 1
-        mask_px = camera.save_binary_mask(
-            paths.block_mask_path(i, block_index), tw, seg, block)
-
-        if mode == "pull" and pull_direction == "all":
-            directions = removal.pull_directions(tw, block)
-        else:
-            directions = (pull_direction,)
-
-        for direction in directions:
-            T.restore_state(tw, mem_state)
-            t0 = time.time()
-            out = removal.remove(tw, block, mode, rng, direction=direction)
-            result["times"].append(time.time() - t0)
-            result["trials"].append(dict(
-                tower_id=i, block_id=block_index,
-                level=tw.level_of[block], position_in_level=tw.slot_of[block],
-                mode=mode, outcome=out.outcome, pull_direction=out.pull_direction,
-                max_displacement=round(out.max_displacement, 5),
-                max_tilt_deg=round(out.max_tilt_deg, 3),
-                peak_force=round(out.peak_force, 2),
-                extract_time=round(out.extract_time, 3),
-                mask_pixels=mask_px, seed=seed, camera_params=cam_str,
-            ))
-
+        num_gaps=tw.n_gaps, grid=grid, base_tilt_deg=round(base_tilt, 3),
+        settle_seconds=round(settle_secs, 3))
+    result["seconds"] = time.time() - t0
     camera.release_renderers()
     return result
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Generate Jenga removal data")
+    ap = argparse.ArgumentParser(description="Generate Jenga per-block risk data")
     ap.add_argument("--towers", type=int, default=C.DEFAULT_TOWERS)
-    ap.add_argument("--mode", choices=["delete", "pull"], default="delete")
-    ap.add_argument("--pull-direction", choices=["end", "side", "all"], default="end",
-                    help="end: one random end; side: outer blocks only; "
-                         "all: both ends plus outward side when available")
+    ap.add_argument("--views", type=int, default=C.VIEWS_PER_TOWER,
+                    help="photos per tower; view 0 is the fixed reference shot")
     ap.add_argument("--out", default="data/")
     ap.add_argument("--seed", type=int, default=C.DEFAULT_SEED)
-    ap.add_argument("--candidates", default=str(C.CANDIDATES_PER_TOWER),
-                    help="blocks to try per tower, or 'all'")
     ap.add_argument("--workers", type=int, default=default_workers(),
                     help="parallel worker processes; 1 runs in this process, "
                          "which is what you want when debugging")
     args = ap.parse_args()
-    if args.mode != "pull" and args.pull_direction != "end":
-        ap.error("--pull-direction applies only to --mode pull")
+    if args.views < 1:
+        ap.error("--views must be at least 1")
 
-    per_tower = None if args.candidates == "all" else int(args.candidates)
     workers = max(1, min(args.workers, args.towers))
-
     writer = DatasetWriter(args.out)
-    counts = Counter()
+    results = []
     rejected = []
-    trial_times = []
-    tower_rows = []
-    trial_rows = []
+    counts = Counter()
     t_start = time.time()
 
-    jobs = [dict(tower_id=i, seed=args.seed * 100000 + i, mode=args.mode,
-                 pull_direction=args.pull_direction, out=args.out,
-                 per_tower=per_tower)
-            for i in range(args.towers)]
+    jobs = [dict(tower_id=i, seed=args.seed * 100000 + i, views=args.views,
+                 out=args.out) for i in range(args.towers)]
 
     bar = tqdm(total=len(jobs), desc="towers", unit="tower")
 
@@ -180,14 +171,10 @@ def main():
             bar.write(f"[reject] tower {res['tower_id']} "
                       f"(seed {res['seed']}) would not stand")
         else:
-            tower_rows.append(res["tower_row"])
-            trial_rows.extend(res["trials"])
-            trial_times.extend(res["times"])
-            for row in res["trials"]:
-                counts[row["outcome"]] += 1
+            results.append(res)
+            counts.update(row["risk_level"] for row in res["labels"])
         bar.update(1)
-        bar.set_postfix(**{k: counts[k] for k in ("stable", "collapse", "stuck")
-                           if counts[k]})
+        bar.set_postfix(**{k: counts[k] for k in risk.RISK_LEVELS if counts[k]})
 
     if workers == 1:
         for job in jobs:
@@ -201,55 +188,66 @@ def main():
                 absorb(res)
     bar.close()
 
-    # Workers finish out of order; sort so the CSVs are byte-identical
-    # whatever --workers was set to.
-    tower_rows.sort(key=lambda r: r["tower_id"])
-    trial_rows.sort(key=lambda r: (r["tower_id"], r["block_id"],
-                                   r.get("pull_direction") or ""))
-    for row in tower_rows:
-        writer.write_tower(**row)
-    for row in trial_rows:
-        writer.write_trial(**row)
+    # Workers finish out of order; sort so the CSVs are identical whatever
+    # --workers was set to.
+    results.sort(key=lambda r: r["tower_id"])
+    for res in results:
+        writer.write("towers", **res["tower"])
+        for row in res["labels"]:
+            writer.write("labels", **row)
+        for row in res["views"]:
+            writer.write("views", **row)
+        for row in res["visibility"]:
+            writer.write("visibility", **row)
     writer.close()
-    camera.release_renderers()
 
-    total = sum(counts.values())
-    elapsed = time.time() - t_start
-    print("\n" + "=" * 58)
-    print(f"  towers requested : {args.towers}")
-    print(f"  towers rejected  : {len(rejected)}")
-    print(f"  trials written   : {total}   mode={args.mode}")
+    summarise(args, results, rejected, counts, workers, time.time() - t_start)
+
+
+def summarise(args, results, rejected, counts, workers, elapsed) -> None:
+    labels = [row for res in results for row in res["labels"]]
+    total = len(labels)
+    print("\n" + "=" * 62)
+    print(f"  towers built     : {len(results)} of {args.towers}"
+          f"  ({len(rejected)} rejected, would not stand)")
+    print(f"  blocks labelled  : {total}   views per tower: {args.views}"
+          f"   images: {len(results) * args.views}")
     print(f"  workers          : {workers}")
-    print("-" * 58)
-    for label in ("stable", "collapse", "stuck"):
-        n = counts[label]
+    print("-" * 62)
+    for level in risk.RISK_LEVELS:
+        n = counts[level]
         pct = 100.0 * n / total if total else 0.0
-        print(f"  {label:<9}: {n:5d}  ({pct:5.1f}%)")
-    print("-" * 58)
-    if trial_times:
-        # Only removal trials are timed, not tower building or rendering, so
-        # this is CPU time per trial -- not a share of the wall clock.
-        print(f"  avg time / trial : {sum(trial_times)/len(trial_times):.2f} s of CPU")
-    if elapsed > 0:
-        done = args.towers - len(rejected)
-        print(f"  throughput       : {60*done/elapsed:.1f} towers/min, "
-              f"{total/elapsed:.1f} trials/s")
-    print(f"  total wall time  : {elapsed:.0f} s")
-    print(f"  output           : {args.out}")
-    print("=" * 58)
+        print(f"  {level:<9}: {n:6d}  ({pct:5.1f}%)")
+    print("-" * 62)
+    if labels:
+        drops = np.array([r["margin_drop_deg"] for r in labels
+                          if r["outcome"] == "stable"])
+        if drops.size:
+            q = np.percentile(drops, [50, 75, 90, 95])
+            print("  margin drop of survivors (deg): "
+                  + "  ".join(f"p{p}={v:.2f}" for p, v in zip((50, 75, 90, 95), q)))
 
-    missing = [k for k in ("stable", "collapse", "stuck") if counts[k] == 0]
-    if missing:
+        # The structural rule is a free sanity check on the physics: it
+        # predicted collapse 98% of the time on earlier data.
+        grids = {res["tower_id"]: res["tower"]["grid"] for res in results}
+        hits = sum((r["outcome"] == "collapse") ==
+                   risk.structural_rule(grids[r["tower_id"]], r["block_id"] - 1)
+                   for r in labels)
+        print(f"  structural rule agrees with collapse labels: {100 * hits / total:.1f}%")
+    if elapsed > 0 and results:
+        print(f"  throughput       : {60 * len(results) / elapsed:.1f} towers/min"
+              f"  ({elapsed:.0f} s total)")
+    print(f"  output           : {args.out}")
+    print("=" * 62)
+
+    missing = [k for k in risk.RISK_LEVELS if counts[k] == 0]
+    if missing and total:
         print(f"\n  NOTE: no {', '.join(missing)} labels in this run.")
-        if "collapse" in missing:
-            print("        Raise GAPS_MAX in config.py -- pristine towers almost")
-            print("        never collapse from a single removal.")
-        if "stable" in missing:
-            print("        Check untouched controls, contact loads and grip behaviour")
-            print("        before changing tower geometry or label thresholds.")
-        if "stuck" in missing:
-            print("        Lower PULL_MAX_FORCE in config.py (delete mode can")
-            print("        never produce `stuck` -- it is a pull-only label).")
+        if "high" in missing:
+            print("        Raise GAPS_MAX -- pristine towers almost never collapse.")
+        if "medium" in missing or "low" in missing:
+            print("        Move RISK_MEDIUM_DROP_DEG to a percentile of the margin"
+                  " drop printed above.")
 
 
 if __name__ == "__main__":
