@@ -141,10 +141,24 @@ a minute of wall time per tower with the default workers.
 | `--workers N` | half your cores | parallel processes; `1` = serial |
 | `--seed N` | 0 | changes every tower in the run |
 | `--out DIR` | `data/` | where to write |
+| `--resume` | off | finish an interrupted run in `--out`, or add more towers to a finished one |
 
-A big overnight run:
+A big overnight run, kept awake with `caffeinate` so the Mac cannot sleep
+until it finishes (macOS only; the lid must stay open):
 
-    .venv/bin/python generate.py --towers 300 --views 6 --out data/big_run
+    caffeinate -ims .venv/bin/python generate.py --towers 300 --views 6 --out data/big_run
+
+Each tower is saved to `<out>/parts/` the moment it finishes, and the CSVs are
+rebuilt from those files at the end. If a run is interrupted -- a crash, a
+restart, a closed lid -- nothing already finished is lost. Pick up where it
+stopped with the **same command plus `--resume`**:
+
+    caffeinate -ims .venv/bin/python generate.py --towers 300 --views 6 --out data/big_run --resume
+
+`--resume` refuses to run if `--seed` or `--views` differ from the original, so
+two different runs can never be mixed into one dataset. Raising `--towers` with
+`--resume` extends a finished run. Without `--resume`, `generate.py` refuses to
+write into a folder that already holds a run.
 
 Reproducibility: a tower is fully determined by its seed, so `--workers` only
 changes speed; the CSVs come out identical whatever it is set to. Changing

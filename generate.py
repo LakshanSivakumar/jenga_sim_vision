@@ -16,11 +16,13 @@ images -- so worker count is the main throughput lever.
 from __future__ import annotations
 
 import argparse
+import json
 import multiprocessing as mp
 import os
 import random
 import time
 from collections import Counter
+from pathlib import Path
 
 import numpy as np
 from tqdm import tqdm
@@ -139,6 +141,37 @@ def run_tower(job: dict) -> dict:
     return result
 
 
+# ---------------------------------------------------------------------------
+# Saving as we go
+# ---------------------------------------------------------------------------
+# Each finished tower is written to its own small file in <out>/parts/ the
+# moment it arrives, and the CSVs are rebuilt from those files at the end.
+# A long run that is interrupted -- a crash, a sleep, a closed lid -- then
+# keeps every tower it finished, and `--resume` carries on from there.
+
+def part_path(out, tower_id: int) -> Path:
+    return Path(out) / "parts" / f"tower_{tower_id:04d}.json"
+
+
+def _plain(obj):
+    """Let json write numpy numbers."""
+    if hasattr(obj, "item"):
+        return obj.item()
+    raise TypeError(f"cannot serialise {type(obj).__name__}")
+
+
+def save_part(out, res: dict) -> None:
+    path = part_path(out, res["tower_id"])
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(res, default=_plain))
+    tmp.replace(path)          # atomic: a half-written file never looks finished
+
+
+def load_parts(out) -> dict[int, dict]:
+    return {r["tower_id"]: r for r in
+            (json.loads(p.read_text()) for p in sorted((Path(out) / "parts").glob("tower_*.json")))}
+
+
 def main():
     ap = argparse.ArgumentParser(description="Generate Jenga per-block risk data")
     ap.add_argument("--towers", type=int, default=C.DEFAULT_TOWERS)
@@ -149,37 +182,53 @@ def main():
     ap.add_argument("--workers", type=int, default=default_workers(),
                     help="parallel worker processes; 1 runs in this process, "
                          "which is what you want when debugging")
+    ap.add_argument("--resume", action="store_true",
+                    help="finish an interrupted run in --out instead of starting over")
     args = ap.parse_args()
     if args.views < 1:
         ap.error("--views must be at least 1")
 
-    workers = max(1, min(args.workers, args.towers))
-    writer = DatasetWriter(args.out)
-    results = []
-    rejected = []
-    counts = Counter()
-    t_start = time.time()
+    out = Path(args.out)
+    run_file = out / "run.json"
+    config = {"seed": args.seed, "views": args.views}
+    done = {}
+    if (out / "parts").exists() and any((out / "parts").glob("tower_*.json")):
+        if not args.resume:
+            ap.error(f"{out} already holds towers from an earlier run. Add --resume to "
+                     f"finish that run, or choose a new --out.")
+        earlier = json.loads(run_file.read_text()) if run_file.exists() else None
+        if earlier is not None and earlier != config:
+            ap.error(f"--resume must use the same settings as the run it continues: "
+                     f"that run used {earlier}, this one asks for {config}")
+        done = load_parts(out)
+    (out / "parts").mkdir(parents=True, exist_ok=True)
+    run_file.write_text(json.dumps(config))
 
-    jobs = [dict(tower_id=i, seed=args.seed * 100000 + i, views=args.views,
-                 out=args.out) for i in range(args.towers)]
+    jobs = [dict(tower_id=i, seed=args.seed * 100000 + i, views=args.views, out=args.out)
+            for i in range(args.towers) if i not in done]
+    workers = max(1, min(args.workers, len(jobs) or 1))
+    counts = Counter(row["risk_level"] for r in done.values() if r["ok"] for row in r["labels"])
+    if done:
+        print(f"resuming: {len(done)} towers already finished, {len(jobs)} to go")
+    t_start = time.time()
 
     bar = tqdm(total=len(jobs), desc="towers", unit="tower")
 
     def absorb(res: dict) -> None:
+        save_part(out, res)
+        done[res["tower_id"]] = res
         if not res["ok"]:
-            rejected.append(res["tower_id"])
             bar.write(f"[reject] tower {res['tower_id']} "
                       f"(seed {res['seed']}) would not stand")
         else:
-            results.append(res)
             counts.update(row["risk_level"] for row in res["labels"])
         bar.update(1)
         bar.set_postfix(**{k: counts[k] for k in risk.RISK_LEVELS if counts[k]})
 
-    if workers == 1:
+    if jobs and workers == 1:
         for job in jobs:
             absorb(run_tower(job))
-    else:
+    elif jobs:
         # "spawn", not "fork": a forked child inherits the parent's OpenGL
         # context, which is not valid across fork and crashes the renderer.
         ctx = mp.get_context("spawn")
@@ -188,9 +237,11 @@ def main():
                 absorb(res)
     bar.close()
 
-    # Workers finish out of order; sort so the CSVs are identical whatever
-    # --workers was set to.
-    results.sort(key=lambda r: r["tower_id"])
+    # Rebuild the CSVs from every finished tower, in tower order, so they are
+    # identical whatever --workers was and however many times it resumed.
+    results = [done[t] for t in sorted(done) if done[t]["ok"]]
+    rejected = [t for t in sorted(done) if not done[t]["ok"]]
+    writer = DatasetWriter(out)
     for res in results:
         writer.write("towers", **res["tower"])
         for row in res["labels"]:
