@@ -110,10 +110,23 @@ it** gets a risk label. Prints the risk-level breakdown, the survivors' tilt
 margins, and how often the structural rule agrees with the physics. See
 [USAGE.md](USAGE.md) for every flag.
 
-Budget roughly a minute of wall time per tower with the default 5 workers:
-each surviving block gets a tilt test, and that is where 94% of the time goes.
-Each tower is saved the moment it finishes, so an interrupted run loses
-nothing -- rerun the same command with `--resume` to finish it.
+Budget roughly two minutes of wall time per tower with the default 5 workers
+(the 1 ms time step doubled it): each surviving block gets a tilt test, and
+that is where most of the time goes. Each tower is saved the moment it
+finishes, so an interrupted run loses nothing -- rerun the same command with
+`--resume` to finish it.
+
+To split one run across two machines, give each the same `--towers`, `--seed`
+and `--out` name and a different `--shard`:
+
+```bash
+python generate.py --towers 300 --views 6 --out data/v2 --shard 0/2   # machine A
+python generate.py --towers 300 --views 6 --out data/v2 --shard 1/2   # machine B
+```
+
+Then copy machine B's `data/v2` into machine A's (the files never clash) and
+run the same command on A with `--resume` and no `--shard` to build the
+combined CSVs. Both machines must run the same commit and MuJoCo version.
 
 ### `inspect_data.py` — sanity-check by eye
 

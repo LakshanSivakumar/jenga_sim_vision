@@ -142,6 +142,7 @@ a minute of wall time per tower with the default workers.
 | `--seed N` | 0 | changes every tower in the run |
 | `--out DIR` | `data/` | where to write |
 | `--resume` | off | finish an interrupted run in `--out`, or add more towers to a finished one |
+| `--shard` | `0/1` | `I/N`: only build towers whose id % N == I, to split one run across N machines (see README) |
 
 A big overnight run, kept awake with `caffeinate` so the Mac cannot sleep
 until it finishes (macOS only; the lid must stay open):

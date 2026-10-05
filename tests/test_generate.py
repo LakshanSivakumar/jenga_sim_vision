@@ -85,3 +85,28 @@ def test_resume_can_extend_a_finished_run(tmp_path, monkeypatch, fake):
     run(monkeypatch, "--towers", "2", "--views", "1", "--out", str(tmp_path))
     run(monkeypatch, "--towers", "4", "--views", "1", "--out", str(tmp_path), "--resume")
     assert pd.read_csv(tmp_path / "towers.csv").tower_id.tolist() == [0, 1, 2]   # 3 rejected
+
+
+def test_shards_split_the_work_and_merge(tmp_path, monkeypatch):
+    """Two machines, each building half; copying one folder into the other and
+    resuming gives the same dataset as building everything in one place."""
+    import shutil
+    ran = {0: [], 1: []}
+    for k in (0, 1):
+        monkeypatch.setattr(generate, "run_tower",
+                            lambda job, k=k: ran[k].append(job["tower_id"]) or fake_tower(job))
+        run(monkeypatch, "--towers", "6", "--views", "1", "--out", str(tmp_path / f"m{k}"),
+            "--shard", f"{k}/2")
+    assert ran == {0: [0, 2, 4], 1: [1, 3, 5]}
+
+    shutil.copytree(tmp_path / "m1", tmp_path / "m0", dirs_exist_ok=True)
+    rerun = []
+    monkeypatch.setattr(generate, "run_tower", lambda job: rerun.append(job) or fake_tower(job))
+    run(monkeypatch, "--towers", "6", "--views", "1", "--out", str(tmp_path / "m0"), "--resume")
+    assert rerun == []                                                 # nothing rebuilt
+    assert pd.read_csv(tmp_path / "m0" / "towers.csv").tower_id.tolist() == [0, 1, 2, 4, 5]
+
+
+def test_bad_shard_is_refused(tmp_path, monkeypatch, fake):
+    with pytest.raises(SystemExit):
+        run(monkeypatch, "--towers", "2", "--out", str(tmp_path), "--shard", "2/2")

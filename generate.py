@@ -185,9 +185,19 @@ def main():
                          "which is what you want when debugging")
     ap.add_argument("--resume", action="store_true",
                     help="finish an interrupted run in --out instead of starting over")
+    ap.add_argument("--shard", default="0/1", metavar="I/N",
+                    help="only build towers whose id %% N == I, to split one run across "
+                         "machines: run 0/2 here and 1/2 there with the same --towers and "
+                         "--seed, copy the other machine's --out folder into this one, "
+                         "then run once more with --resume and no --shard to merge")
     args = ap.parse_args()
     if args.views < 1:
         ap.error("--views must be at least 1")
+    try:
+        shard, shards = (int(x) for x in args.shard.split("/"))
+        assert 0 <= shard < shards
+    except (ValueError, AssertionError):
+        ap.error("--shard must look like 0/2: this machine's number, then how many machines")
 
     out = Path(args.out)
     run_file = out / "run.json"
@@ -206,9 +216,11 @@ def main():
     run_file.write_text(json.dumps(config))
 
     jobs = [dict(tower_id=i, seed=args.seed * 100000 + i, views=args.views, out=args.out)
-            for i in range(args.towers) if i not in done]
+            for i in range(args.towers) if i not in done and i % shards == shard]
     workers = max(1, min(args.workers, len(jobs) or 1))
     counts = Counter(row["risk_level"] for r in done.values() if r["ok"] for row in r["labels"])
+    if shards > 1:
+        print(f"shard {shard}/{shards}: towers with id % {shards} == {shard}")
     if done:
         print(f"resuming: {len(done)} towers already finished, {len(jobs)} to go")
     t_start = time.time()
