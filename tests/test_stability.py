@@ -56,6 +56,22 @@ def test_untouched_tower_stands_for_ten_seconds(settled):
     assert tilt < C.COLLAPSE_TILT_DEG, f"tilted {tilt:.2f} deg"
 
 
+def test_gapped_tower_does_not_creep():
+    """A mid-game tower must stand still, not slowly slide apart.
+
+    At a 2 ms time step the top of this tower slid 11 mm in 10 s, which also
+    ate into the tilt test. At 1 ms it moves under 3 mm.
+    """
+    import random
+    tw = T.build_tower(seed=0)
+    T.settle(tw)
+    T.make_gaps(tw, random.Random(0), 8)
+    before = T.snapshot(tw, tw.present_ids())
+    T.simulate(tw, 10.0)
+    drift, _tilt = max_displacement(tw, before)
+    assert drift < 0.005, f"idle tower crept {drift * 1000:.1f} mm in 10 s"
+
+
 def test_tower_does_not_sink(settled):
     """Blocks must not slowly penetrate each other under load."""
     T.simulate(settled, 5.0)

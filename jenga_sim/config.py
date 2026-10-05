@@ -48,10 +48,31 @@ JITTER_YAW_DEG = 1.0     # +/- 1 degree about the vertical axis
 # Larger variation can make the initial tower unstable.
 JITTER_SIZE_FRAC = 0.002
 
+# Imperfect towers. Real towers are rarely tidy: they lean a little, layers
+# sit slightly off and twisted, and players leave tested blocks part-way out.
+# generate.py builds this share of towers that way (tower.is_imperfect);
+# towers.csv records which, and how much.
+IMPERFECT_FRACTION = 0.5
+LEAN_MAX_DEG = 0.4            # whole-tower lean
+LAYER_SHIFT = 0.0015          # +/- 1.5 mm per layer, on top of the block jitter
+LAYER_TWIST_DEG = 1.5         # +/- per layer
+PROTRUDE_PROB = 0.08          # chance a block (below the top layer) sticks out
+PROTRUDE_MIN = 0.002          # 2 mm
+PROTRUDE_MAX = 0.010          # 10 mm
+
 # ---------------------------------------------------------------------------
 # Physics engine (MuJoCo)
 # ---------------------------------------------------------------------------
-TIME_STEP = 0.002
+# 1 ms, not 2. At 2 ms a standing tower slowly slid apart: the top section of
+# a gapped tower drifted sideways about 1 mm/s (11 mm in 10 s), which also ate
+# into the tilt test. Measured on the same towers:
+#   time step   idle drift in 10 s   labels vs 2 ms (48 blocks)   cost
+#     2 ms          5 - 11 mm                  -                    1x
+#     1 ms        1.4 - 3.9 mm            43/48 (all med<->low)     ~2x
+#     0.5 ms           1.5 mm             44/48                     ~4x
+# High-risk labels never changed. Stiffer contacts did not help, and the
+# no-slip solver did not stop the drift; a smaller step did.
+TIME_STEP = 0.001
 INTEGRATOR = "implicitfast"
 CONE = "pyramidal"        # "elliptic" is more accurate but would not settle here
 SOLVER_ITERATIONS = 100
@@ -66,13 +87,14 @@ ROLLING_FRICTION = 0.0001
 # us work at real Jenga scale: it is a TIME, not a distance, so it does not
 # care how big the blocks are.
 #
-# 4x the timestep, not the 2x you might reach for first. Measured over 5 seeds:
+# 8 ms, measured as 4x the old 2 ms timestep, not the 2x you might reach for
+# first. Kept at 8 ms when the step halved. Measured over 5 seeds (at 2 ms):
 #   solref    towers standing   worst drift   settling   position buzz
 #   2x dt          5/5            0.679 cm     0.06 mm      11.9 um
 #   4x dt          5/5            0.251 cm     0.24 mm       3.5 um
 # Softer contacts converge better here, so the tower is both steadier and
 # visibly calmer, and it costs only a fifth of a millimetre of extra settling.
-SOLREF = (4 * TIME_STEP, 1.0)
+SOLREF = (0.008, 1.0)
 SOLIMP = (0.95, 0.99, 0.0001)
 # Contact margin. Sharp box corners dragging across a neighbour's face can
 # snap between edge and face contacts; a small margin smooths that over.
@@ -87,7 +109,7 @@ CONTACT_MARGIN = 0.0
 # motion over a window drops cleanly from ~14000 um to ~30 um once the tower
 # is actually at rest.
 SETTLE_MAX_SECONDS = 2.0
-SETTLE_WINDOW_STEPS = 25      # 0.05 s at the default timestep
+SETTLE_WINDOW_STEPS = round(0.05 / TIME_STEP)   # 0.05 s windows
 SETTLE_POS_TOL = 1e-4         # 0.1 mm net movement per window
 SETTLE_ANG_TOL = 0.25         # degrees net rotation per window
 SETTLE_STABLE_CHECKS = 3      # consecutive quiet windows needed
@@ -219,10 +241,20 @@ DEFAULT_SEED = 0
 # move without regenerating anything.
 TILT_MAX_DEG = 15.0           # an intact tower tips over as a whole near here
 TILT_RAMP_SECONDS = 2.0       # 0 -> TILT_MAX_DEG: slow enough to be quasi-static
-TILT_CHECK_EVERY = 10         # steps between failure checks (~0.15 deg)
+# Check every 5 ms, which is 0.0375 deg of tilt. It used to be 0.15 deg, but
+# with the drift fixed (see TIME_STEP) most removals change the margin by less
+# than that, so the coarse test read them all as 0 and medium shrank to ~2%.
+# The checks are cheap next to the physics steps.
+TILT_CHECK_EVERY = round(0.005 / TIME_STEP)
 TILT_DIRECTIONS = ((1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0))
 RISK_HIGH_BELOW_DEG = 1.0
-RISK_MEDIUM_DROP_DEG = 0.3    # 2x the tilt test's resolution; see README
+# 3x the measurement noise. Re-measuring 20 surviving blocks 5 times, each
+# with every block nudged by up to 0.05 mm, the drop varied by 0.10 deg on
+# average (median 0.05 deg); big drops repeated closely (2.44 -> 2.44-2.51).
+# On a 10-tower check this gives about 14% medium (0.2 deg would give 19%,
+# 0.1 deg 30%, much of it noise). The raw margin_drop_deg is stored, so
+# inspect_data.py --medium-drop can re-bin without regenerating.
+RISK_MEDIUM_DROP_DEG = 0.3
 
 # ---------------------------------------------------------------------------
 # Push mode -- the way people actually take a middle block out

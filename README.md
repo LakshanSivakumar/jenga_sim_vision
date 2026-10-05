@@ -83,6 +83,7 @@ On Windows: `.venv\Scripts\python.exe play.py` for the playground, and
 | `A` / `D` | move the selection across the layer |
 | `P` | pull the selected block out slowly (force-limited) |
 | `X` | delete the selected block instantly |
+| `T` | tilt test: tilt the table each way until the tower gives way, as the dataset does, then print the risk level of the block you removed |
 | `R` | reset to the saved tower |
 | `N` | build a new random tower |
 | `C` | save a snapshot PNG to `snapshots/` |
@@ -94,8 +95,9 @@ The selected block turns green. Outcomes print to the terminal with
 displacement, tilt and (for pulls) peak force. Keys only register while the
 MuJoCo window has focus.
 
-Flags: `--seed N`, `--gaps N`, `--slow 0` (run removals at full speed instead
-of watchable speed).
+Flags: `--seed N`, `--gaps N`, `--slow 0` (run removals and tilt tests at full
+speed instead of watchable speed), `--tower N` (open tower N from `--data`,
+default `data/big_run`; its tilt tests then reproduce `labels.csv` exactly).
 
 ### `generate.py` — headless dataset
 

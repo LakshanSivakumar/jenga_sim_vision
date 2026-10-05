@@ -47,7 +47,7 @@ def build_one(seed: int, rng: random.Random):
     `ok` is False when the tower could not stand on its own; the caller
     should throw it away.
     """
-    tw = T.build_tower(seed=seed)
+    tw = T.build_tower(seed=seed, imperfect=T.is_imperfect(seed))
     converged, secs = T.settle(tw)
     if not converged:
         return tw, False, secs
@@ -135,7 +135,8 @@ def run_tower(job: dict) -> dict:
     result["tower"] = dict(
         tower_id=i, seed=seed, num_blocks=len(tw.present_ids()),
         num_gaps=tw.n_gaps, grid=grid, base_tilt_deg=round(base_tilt, 3),
-        settle_seconds=round(settle_secs, 3))
+        settle_seconds=round(settle_secs, 3), imperfect=tw.imperfect,
+        lean_deg=tw.lean_deg, protruding=tw.protruding)
     result["seconds"] = time.time() - t0
     camera.release_renderers()
     return result

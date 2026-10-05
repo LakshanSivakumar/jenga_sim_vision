@@ -21,8 +21,16 @@ from . import config as C
 # Model construction
 # ---------------------------------------------------------------------------
 
-def _block_xml(index: int, level: int, slot: int, rng: random.Random) -> str:
-    """One free-floating block body, jittered."""
+def _block_xml(index: int, level: int, slot: int, rng: random.Random,
+               layer: tuple[float, float, float] = (0.0, 0.0, 0.0),
+               protrude: float = 0.0) -> str:
+    """One free-floating block body, jittered.
+
+    `layer` is (dx, dy, twist) for the whole layer and `protrude` slides the
+    block along its own length; both come from imperfections() and are zero
+    for a tidy tower. They are applied after every draw from `rng`, so a tidy
+    tower and an imperfect one with the same seed have identical blocks.
+    """
     half = [C.BLOCK_LENGTH / 2, C.BLOCK_WIDTH / 2, C.BLOCK_HEIGHT / 2]
     if C.JITTER_SIZE_FRAC > 0:
         half = [h * (1.0 + rng.uniform(-1, 1) * C.JITTER_SIZE_FRAC) for h in half]
@@ -35,6 +43,14 @@ def _block_xml(index: int, level: int, slot: int, rng: random.Random) -> str:
     x += rng.uniform(-1, 1) * C.JITTER_POS
     y += rng.uniform(-1, 1) * C.JITTER_POS
     yaw += math.radians(rng.uniform(-1, 1) * C.JITTER_YAW_DEG)
+
+    dx, dy, twist = layer
+    if twist or dx or dy or protrude:
+        c, s_ = math.cos(twist), math.sin(twist)
+        x, y = c * x - s_ * y + dx, s_ * x + c * y + dy
+        yaw += twist
+        x += protrude * math.cos(yaw)       # along the block's long axis
+        y += protrude * math.sin(yaw)
     qw, qz = math.cos(yaw / 2), math.sin(yaw / 2)
 
     # Vary brightness, not hue: jittering each channel independently turns
@@ -78,14 +94,51 @@ def finger_reach() -> float:
     return C.BLOCK_LENGTH / 2 + nose + C.FINGER_GAP
 
 
-def build_xml(seed: int = 0) -> str:
+def is_imperfect(seed: int) -> bool:
+    """Whether generate.py builds this seed's tower imperfect."""
+    return random.Random(seed * 1_000_003 + 17).random() < C.IMPERFECT_FRACTION
+
+
+def imperfections(seed: int) -> dict:
+    """A slightly messy tower, the way real ones are after a few rounds.
+
+    The whole tower leans a little, each layer is shifted and twisted a
+    little, and a few blocks are left sticking out of one end. Drawn from its
+    own random stream, so it never changes the blocks themselves.
+    """
+    rng = random.Random(seed * 1_000_003 + 29)
+    lean = math.radians(rng.uniform(0.0, C.LEAN_MAX_DEG))
+    heading = rng.uniform(0.0, 2 * math.pi)
+    layers, protrude = [], []
+    for level in range(C.NUM_LAYERS):
+        z = C.BLOCK_HEIGHT / 2 + level * C.BLOCK_HEIGHT
+        layers.append((math.tan(lean) * z * math.cos(heading) + rng.uniform(-1, 1) * C.LAYER_SHIFT,
+                       math.tan(lean) * z * math.sin(heading) + rng.uniform(-1, 1) * C.LAYER_SHIFT,
+                       math.radians(rng.uniform(-1, 1) * C.LAYER_TWIST_DEG)))
+        for _slot in range(C.BLOCKS_PER_LAYER):
+            out = 0.0
+            if level < C.NUM_LAYERS - 1 and rng.random() < C.PROTRUDE_PROB:
+                out = rng.choice((-1, 1)) * rng.uniform(C.PROTRUDE_MIN, C.PROTRUDE_MAX)
+            protrude.append(out)
+    return {"lean_deg": round(math.degrees(lean), 3),
+            "lean_heading_deg": round(math.degrees(heading), 1),
+            "layers": layers, "protrude": protrude,
+            "protruding": sum(1 for p in protrude if p)}
+
+
+def build_xml(seed: int = 0, imperfect: bool = False) -> str:
     """Generate the MJCF model: independent free blocks on a table."""
     rng = random.Random(seed)
+    imp = imperfections(seed) if imperfect else None
     bodies = []
     index = 0
     for level in range(C.NUM_LAYERS):
         for slot in range(C.BLOCKS_PER_LAYER):
-            bodies.append(_block_xml(index, level, slot, rng))
+            if imp is None:
+                bodies.append(_block_xml(index, level, slot, rng))
+            else:
+                bodies.append(_block_xml(index, level, slot, rng,
+                                         imp["layers"][level], imp["protrude"][index]))
             index += 1
 
     lx, ly, lz = C.LIGHT_POS
@@ -152,6 +205,9 @@ class Tower:
     finger_geoms: list[int] = field(default_factory=list)
     seed: int = 0
     n_gaps: int = 0
+    imperfect: bool = False
+    lean_deg: float = 0.0
+    protruding: int = 0
 
     @property
     def n_blocks(self) -> int:
@@ -187,11 +243,19 @@ class Tower:
         return self.data.xmat[self.body_id[index]].reshape(3, 3)[:, 0].copy()
 
 
-def build_tower(seed: int = 0) -> Tower:
-    """Compile a fresh model and return an unsettled tower."""
-    model = mujoco.MjModel.from_xml_string(build_xml(seed))
+def build_tower(seed: int = 0, imperfect: bool = False) -> Tower:
+    """Compile a fresh model and return an unsettled tower.
+
+    `imperfect` builds the slightly messy version (see imperfections()).
+    Loading a saved state works either way: the state holds every block's
+    pose, and the blocks themselves are the same.
+    """
+    model = mujoco.MjModel.from_xml_string(build_xml(seed, imperfect))
     data = mujoco.MjData(model)
-    tw = Tower(model=model, data=data, seed=seed)
+    tw = Tower(model=model, data=data, seed=seed, imperfect=imperfect)
+    if imperfect:
+        imp = imperfections(seed)
+        tw.lean_deg, tw.protruding = imp["lean_deg"], imp["protruding"]
 
     n = C.NUM_LAYERS * C.BLOCKS_PER_LAYER
     for i in range(n):

@@ -71,7 +71,8 @@ def structural_rule(grid: str, index: int) -> bool:
 # Tilt test
 # ---------------------------------------------------------------------------
 
-def tilt_margin(tw: T.Tower, state, cap: float | None = None) -> float:
+def tilt_margin(tw: T.Tower, state, cap: float | None = None,
+                on_step=None, on_side=None) -> float:
     """Weakest-direction table tilt (degrees) the tower survives.
 
     Tilting the table is done by tilting gravity, which is equivalent and
@@ -84,6 +85,11 @@ def tilt_margin(tw: T.Tower, state, cap: float | None = None) -> float:
     need ramping that far, since they can only lower the minimum. That makes
     the whole test roughly three times cheaper.
 
+    `on_step(side, angle)` runs after every physics step, and `on_side(side,
+    angle, failed)` once each side is done, while the table is still tilted.
+    play.py uses them to show the test; neither changes the result, because
+    every side starts again from `state`.
+
     Leaves the tower exactly as `state` describes, with gravity restored.
     """
     cap = C.TILT_MAX_DEG if cap is None else cap
@@ -95,22 +101,29 @@ def tilt_margin(tw: T.Tower, state, cap: float | None = None) -> float:
     worst = cap
 
     try:
-        for dx, dy in C.TILT_DIRECTIONS:
+        for side, (dx, dy) in enumerate(C.TILT_DIRECTIONS):
             T.restore_state(tw, state)
             snap = T.snapshot(tw, tw.present_ids())
             n = int(math.ceil(worst / per_step - 1e-9))
+            angle, failed = 0.0, False
             for s in range(n):
-                th = math.radians(per_step * (s + 1))
+                angle = per_step * (s + 1)
+                th = math.radians(angle)
                 m.opt.gravity[:] = (g * math.sin(th) * dx,
                                     g * math.sin(th) * dy,
                                     -g * math.cos(th))
                 mujoco.mj_step(m, d)
+                if on_step is not None:
+                    on_step(side, angle)
                 if (s + 1) % C.TILT_CHECK_EVERY == 0 or s == n - 1:
                     mujoco.mj_kinematics(m, d)
                     disp, tilt = max_displacement(tw, snap)
                     if disp > C.COLLAPSE_DISPLACEMENT or tilt > C.COLLAPSE_TILT_DEG:
-                        worst = min(worst, per_step * (s + 1))
+                        worst = min(worst, angle)
+                        failed = True
                         break
+            if on_side is not None:
+                on_side(side, angle, failed)
     finally:
         m.opt.gravity[:] = g0
         T.restore_state(tw, state)

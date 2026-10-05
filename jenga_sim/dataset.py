@@ -27,7 +27,7 @@ from PIL import Image
 
 TOWER_FIELDS = [
     "tower_id", "seed", "num_blocks", "num_gaps", "grid", "base_tilt_deg",
-    "settle_seconds",
+    "settle_seconds", "imperfect", "lean_deg", "protruding",
 ]
 
 LABEL_FIELDS = [
