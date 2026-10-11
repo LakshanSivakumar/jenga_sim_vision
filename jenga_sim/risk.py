@@ -132,9 +132,16 @@ def tilt_margin(tw: T.Tower, state, cap: float | None = None,
 
 def level_for(margin: float, drop: float, high_below: float | None = None,
               medium_drop: float | None = None) -> str:
-    """Risk level from the margin left and the margin this removal cost."""
+    """Risk level from the margin left and the margin this removal cost.
+
+    Margins come in whole tilt-test steps, so a drop that is exactly the
+    threshold is common -- and in floating point 5.1 - 4.8 is 0.29999...,
+    which used to read as low. Rounding first makes the threshold inclusive
+    as intended.
+    """
     high_below = C.RISK_HIGH_BELOW_DEG if high_below is None else high_below
     medium_drop = C.RISK_MEDIUM_DROP_DEG if medium_drop is None else medium_drop
+    margin, drop = round(margin, 6), round(drop, 6)
     if margin < high_below:
         return "high"
     if drop >= medium_drop:

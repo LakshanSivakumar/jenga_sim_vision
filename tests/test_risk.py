@@ -56,6 +56,7 @@ def test_structural_rule(row, slot, left, collapses):
     (5.0, C.RISK_MEDIUM_DROP_DEG - 0.01, "low"),
     (5.0, 0.0, "low"),
     (5.0, -1.0, "low"),                                    # removal helped
+    (4.8, 5.1 - 4.8, "medium"),                            # 0.2999...: exactly on the threshold
 ])
 def test_risk_level_thresholds(margin, drop, level):
     assert risk.level_for(margin, drop) == level
